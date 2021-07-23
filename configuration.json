@@ -1,0 +1,52 @@
+[
+  {
+    "key": "UserName",
+    "type": "input",
+    "defaultValue": "",
+    "templateOptions": {
+      "label": "UserName",
+      "description": "The Username to connect to Exact Proquro",
+      "required": true
+    }
+  },
+  {
+    "key": "Password",
+    "type": "input",
+    "defaultValue": "",
+    "templateOptions": {
+      "type": "password",
+      "label": "Password",
+      "required": true
+    }
+  },
+  {
+    "key": "ApiKey",
+    "type": "input",
+    "defaultValue": "",
+    "templateOptions": {
+      "label": "ApiKey",
+      "description": "The API Key used to authenticate. This must be retrieved from within the application",
+      "required": true
+    }
+  },
+  {
+    "key": "BaseUrl",
+    "type": "input",
+    "defaultValue": "",
+    "templateOptions": {
+      "label": "BaseUrl",
+      "description": "The url to connect to Exact Proquro",
+      "required": true
+    }
+  },
+  {
+    "key": "IsConnectionTls12",
+    "type": "checkbox",
+    "defaultValue": true,
+    "templateOptions": {
+      "label": "Enable TLS1.2",
+      "description": "Enables TLS 1.2. Note that is not necessary when running the connector in the cloud",
+      "required": false
+    }
+  }
+]
