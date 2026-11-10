@@ -1,126 +1,132 @@
-#######################################################
-# HelloID-Conn-Prov-Target-Exact-Proquro
-#
-# Version: 1.0.0.0
-#######################################################
-$VerbosePreference = "Continue"
+#################################################
+# HelloID-Conn-Prov-Target-Exact-Proquro-Create
+# PowerShell V2
+#################################################
 
-# Initialize default value's
-$config = $configuration | ConvertFrom-Json
-$p = $person | ConvertFrom-Json
-$success = $false
-$auditLogs = New-Object Collections.Generic.List[PSCustomObject]
+# Enable TLS1.2
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
 
-$account = [PSCustomObject]@{
-    externalID            = $p.ExternalId
-    firstName             = $p.Name.GivenName
-    middleInitials        = $p.Name.Initials
-    surName               = $p.Name.FamilyName
-    email                 = $p.Contact.Business.Email
-    telephone             = $p.Contact.Business.Phone.Fixed
-    mobile                = $p.Contact.Business.Phone.Mobile
-    loginName             = $p.UserName
-    password              = ''
-    passwordMustChange    = $true
-    status                = 'active'
-    profileUserExternalId = ''
-} | ConvertTo-Json
-
-#region Helper Functions
-function Resolve-HTTPError {
+#region functions
+function Resolve-ExactProquroError {
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory,
-            ValueFromPipeline
-        )]
-        [object]$ErrorObject
+        [Parameter(Mandatory)]
+        [object]
+        $ErrorObject
     )
     process {
-        $HttpErrorObj = @{
-            FullyQualifiedErrorId = $ErrorObject.FullyQualifiedErrorId
-            MyCommand             = $ErrorObject.InvocationInfo.MyCommand
-            RequestUri            = $ErrorObject.TargetObject.RequestUri
+        $httpErrorObj = [PSCustomObject]@{
+            ScriptLineNumber = $ErrorObject.InvocationInfo.ScriptLineNumber
+            Line             = $ErrorObject.InvocationInfo.Line
+            ErrorDetails     = $ErrorObject.Exception.Message
+            FriendlyMessage  = $ErrorObject.Exception.Message
         }
         if ($ErrorObject.Exception.GetType().FullName -eq 'Microsoft.PowerShell.Commands.HttpResponseException') {
-            $HttpErrorObj['ErrorMessage'] = $ErrorObject.ErrorDetails.Message
-        } elseif ($ErrorObject.Exception.GetType().FullName -eq 'System.Net.WebException') {
+            $httpErrorObj.ErrorDetails = $ErrorObject.ErrorDetails.Message
+        }
+        # Response is null when no connection could be made (wrong BaseUrl or port, host down, TLS failure)
+        elseif ($ErrorObject.Exception.GetType().FullName -eq 'System.Net.WebException' -and $ErrorObject.Exception.Response) {
             $stream = $ErrorObject.Exception.Response.GetResponseStream()
             $stream.Position = 0
-            $streamReader = New-Object System.IO.StreamReader $Stream
-            $errorResponse = $StreamReader.ReadToEnd()
-            $HttpErrorObj['ErrorMessage'] = $errorResponse
+            $streamReader = New-Object System.IO.StreamReader $stream
+            $httpErrorObj.ErrorDetails = $streamReader.ReadToEnd()
         }
-        Write-Output "'$($HttpErrorObj.ErrorMessage)', TargetObject: '$($HttpErrorObj.RequestUri), InvocationCommand: '$($HttpErrorObj.MyCommand)"
+        $httpErrorObj.FriendlyMessage = $httpErrorObj.ErrorDetails
+        Write-Output $httpErrorObj
     }
 }
 #endregion
 
-if (-not($dryRun -eq $true)) {
-    try {
-        Write-Verbose "Creating account for '$($p.DisplayName)'"
+try {
+    # Initial Assignments
+    $outputContext.AccountReference = 'Currently not available'
 
-        if ($($config.IsConnectionTls12)) {
-            Write-Verbose 'Switching to TLS 1.2'
-            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+    # No lookup of an existing account: Exact Proquro creates or updates the user on the same call
+    $lifecycleProcess = 'CreateAccount'
+
+    Write-Information 'Retrieving accessToken'
+    $splatGetTokenParams = @{
+        Uri         = "$($actionContext.Configuration.BaseUrl)/token"
+        Method      = 'POST'
+        ContentType = 'application/x-www-form-urlencoded'
+        Headers     = @{
+            'Accept'        = 'application/json'
+            'Cache-Control' = 'no-cache'
         }
+        Body        = @{
+            grant_type = 'password'
+            username   = $actionContext.Configuration.UserName
+            password   = $actionContext.Configuration.Password
+            apikey     = $actionContext.Configuration.ApiKey
+        }
+    }
+    $accessToken = (Invoke-RestMethod @splatGetTokenParams).access_token
+    if (-not $accessToken) { throw 'No access_token in token response' }
 
-        Write-Verbose 'Retrieving accessToken'
-        $splatGetTokenParams = @{
-            Uri     = "$($config.BaseUrl)/token"
-            Headers = @{
-                "Content-Type"  = "application/json"
-                "Accept"        = "application/json"
-                "Cache-Control" = "no-cache"
+    $headers = @{
+        'Content-Type'  = 'application/json'
+        'Accept'        = 'application/json'
+        'Cache-Control' = 'no-cache'
+        'Authorization' = "Bearer $accessToken"
+    }
+
+    # Process
+    switch ($lifecycleProcess) {
+        'CreateAccount' {
+            # Fixed mapping values arrive as strings, the API expects a boolean
+            $body = $actionContext.Data | Select-Object -Property * -ExcludeProperty passwordMustChange
+            $body | Add-Member -NotePropertyName passwordMustChange -NotePropertyValue ([string]$actionContext.Data.passwordMustChange -eq 'true')
+
+            Write-Information 'Creating and correlating Exact Proquro account'
+            $splatCreateParams = @{
+                Uri         = "$($actionContext.Configuration.BaseUrl)/api/User/Update"
+                Method      = 'POST'
+                Headers     = $headers
+                # UTF-8 bytes: Windows PowerShell 5.1 would send a string body as ISO-8859-1
+                ContentType = 'application/json; charset=utf-8'
+                Body        = [System.Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json))
             }
-            $body = @{
-                "grant_type" = "password&username=$($config.UserName)&password=$($config.Password)&&apikey=$($config.ApiKey)"
+
+            if (-not($actionContext.DryRun -eq $true)) {
+                $createdAccount = Invoke-RestMethod @splatCreateParams
+
+                # Fall back to the mapped externalID when the response has none; never report success without a reference
+                $accountReference = if ($createdAccount.externalId) { $createdAccount.externalId } else { $actionContext.Data.externalID }
+                if (-not $accountReference) { throw 'No externalId in the response and no externalID in the mapped data' }
+                $outputContext.Data = $actionContext.Data
+                $outputContext.AccountReference = $accountReference
             }
+            else {
+                Write-Information '[DryRun] Create and correlate Exact Proquro account, will be executed during enforcement'
+            }
+            $auditLogMessage = "Create account was successful. AccountReference is: [$($outputContext.AccountReference)]"
+            break
         }
-        $accessToken = Invoke-RestMethod @splatGetTokenParams
+    }
 
-        Write-Verbose 'Adding authorization headers'
-        $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
-        $headers.Add("Content-Type", "application/json")
-        $headers.Add("Accept", "application/json")
-        $headers.Add("Cache-Control", "no-cache")
-        $headers.Add("Authorization", "Bearer $accessToken")
-
-        $splatParams = @{
-            Uri      = "$($config.BaseUrl)/api/User/Update"
-            Headers  = $headers
-            Body     = $account
-            Method   = 'POST'
-        }
-        $results = Invoke-RestMethod @splatParams
-        $accountReference = $results.externalId
-        $logMessage = "Account for '$($p.DisplayName)' successfully created. Correlation id: '$accountReference'"
-        Write-Verbose $logMessage
-        $success = $true
-        $auditLogs.Add([PSCustomObject]@{
-            Message = $logMessage
-            IsError = $False
+    $outputContext.success = $true
+    $outputContext.AuditLogs.Add([PSCustomObject]@{
+            Action  = $lifecycleProcess
+            Message = $auditLogMessage
+            IsError = $false
         })
-    } catch {
-        $ex = $PSItem
-        if ( $($ex.Exception.GetType().FullName -eq 'Microsoft.PowerShell.Commands.HttpResponseException') -or $($ex.Exception.GetType().FullName -eq 'System.Net.WebException')) {
-            $errorMessage = Resolve-HTTPError -Error $ex
-            $auditMessage = "Account for '$($p.DisplayName)' not created. Error: $errorMessage"
-        } else {
-            $auditMessage = "Account for '$($p.DisplayName)' not created. Error: $($ex.Exception.Message)"
-        }
-        $auditLogs.Add([PSCustomObject]@{
-            Message = $auditMessage
+}
+catch {
+    $outputContext.success = $false
+    $ex = $PSItem
+    if ($($ex.Exception.GetType().FullName -eq 'Microsoft.PowerShell.Commands.HttpResponseException') -or
+        $($ex.Exception.GetType().FullName -eq 'System.Net.WebException')) {
+        $errorObj = Resolve-ExactProquroError -ErrorObject $ex
+        $auditLogMessage = "Could not create or correlate Exact Proquro account: [$($actionContext.Data.externalID)]. Error: $($errorObj.FriendlyMessage)"
+        Write-Warning "Error at Line '$($errorObj.ScriptLineNumber)': $($errorObj.Line). Error: $($errorObj.ErrorDetails)"
+    }
+    else {
+        $auditLogMessage = "Could not create or correlate Exact Proquro account: [$($actionContext.Data.externalID)]. Error: $($ex.Exception.Message)"
+        Write-Warning "Error at Line '$($ex.InvocationInfo.ScriptLineNumber)': $($ex.InvocationInfo.Line). Error: $($ex.Exception.Message)"
+    }
+    $outputContext.AuditLogs.Add([PSCustomObject]@{
+            Action  = 'CreateAccount'
+            Message = $auditLogMessage
             IsError = $true
         })
-        Write-Error $auditMessage
-    }
 }
-
-$result = [PSCustomObject]@{
-    Success          = $success
-    Account          = $account
-    AccountReference = $accountReference
-    AuditLogs        = $auditLogs
-}
-
-Write-Output $result | ConvertTo-Json -Depth 10
